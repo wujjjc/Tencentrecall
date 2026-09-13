@@ -1,0 +1,21 @@
+# ---- 数据与缓存：本机专属，加起来 30G+，绝不进仓库 ----
+# cache/ 是 HF arrow 推导出的稠密缓存（seq_*.npy / item_feat.npy / logq.npy ...）
+cache/
+# logs/ 是训练输出目录，best.pt / last.pt 单份 fp32 权重就 4.2GB
+logs/
+logs_prepare.out
+*.pt
+*.npy
+# TensorBoard 事件文件
+tb/
+events.out.tfevents.*
+
+# ---- 只读参考资料：别人的代码，不是本仓库的交付物 ----
+baseline/
+O_o/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
