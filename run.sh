@@ -11,6 +11,13 @@
 #   VAL_LOG=none bash run.sh               这次不记
 # 默认 val.jsonl。
 #
+# user token 的先后次序（见 DIFF_vs_O_o.md §2.3）：--user_seq_order 会被原样转给
+# train.py，默认复刻 O_o。环境变量 USER_SEQ_ORDER 是同一件事的另一条路（train.py 的
+# argparse 默认值读的就是它），两者都给时以 --user_seq_order 为准。
+#   OUT_DIR=logs_chrono bash run.sh --user_seq_order chrono
+# 跑哪一套会写进日志的 [env] 行、result.json 与 val.jsonl。
+# 两种布局的指标**不可直接比较**，所以换布局时务必同时换 OUT_DIR。
+#
 # 选卡：**由 train.py 自己挑**（见那里的 auto_pick_gpu / free_gpu）——
 # 在「空闲显存 >= NEED_GB」的卡里选利用率最低的一张，一张都不达标时退化为空闲最多的。
 # 本脚本只负责把手动指定传下去，不重复实现挑卡逻辑：

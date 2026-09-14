@@ -31,12 +31,22 @@ def build_user_sample(items, actions, times, maxlen, has_user, user_id):
 
     布局：右对齐、pad 在左（idx 0 是唯一的 pad 位）。
         S   = maxlen + 1 = 序列槽位数
-        R   = reversed(items[:-1]) + user_tokens
-              即「item 块倒序」接「user 块正序」；R[k] 填到 idx = maxlen - k
+        R   = 中间数组：R[k] 填到 idx = maxlen - k
         target 是最后一条记录的 item，只作标签、不写进 seq
-    为什么 user 块是正序而 item 块倒序：见 O_o/dataset.py:718-741 ——
-    ext = reversed(user_tokens) + item_tokens，再整条 reverse 一次，
-    user 块被反了两次、item 块被反了一次（且丢掉最后一个）。
+
+    **R 的次序 = 最终序列的倒序**（填充从 idx = maxlen 往回走），这一点是下面
+    `token_at` 全部下标的依据，绕在其中读「R 里谁是正序」一定会读反。
+
+    O_o 的写法（`dataset.py:718-741`）是
+        ext = reversed(user_tokens) + item_tokens    # item 块倒序，接 user 块正序
+    再整条 reverse 一次写进 R —— 于是 item 块被反了两次（最终序列里时间正序）、
+    user 块被反了一次（最终序列里**时间倒序**）。我们默认照抄这个结果
+    （`USER_SEQ_ORDER == 'o_o'`）。
+
+    `'chrono'` 下 user 块不再被那次多余的 reversed 影响：它在最终序列里按记录
+    实际顺序（时间正序）排列，与 item 块方向一致。user 块占的槽位不变，
+    受影响的只有各 user 槽位装的是哪条记录、以及 `seq_ts` 的取值 ——
+    走查见 DIFF_vs_O_o.md §2.3。
 
     **user token 的 `seq` 装的是 `user_id`，不是 item id** —— DIFF §7 的走查里
     user 槽位写的是 `U7@400`，`seq` 是主 id 列、每个位置只装自己那一侧的实体。
@@ -55,12 +65,17 @@ def build_user_sample(items, actions, times, maxlen, has_user, user_id):
             "seq_ts", "action900")}
 
     # R[k] 的语义 -> (是否 item, 记录下标)
+    # 填充是「右对齐、idx 从 maxlen 递减」，所以 **R 的次序 = 最终序列的倒序**：
+    # R 里正序的块，在序列里读出来是倒序，反之亦然。
     def token_at(k):
         if k < n - 1:
-            return True, n - 2 - k          # item 块：倒序，丢掉最后一条
+            return True, n - 2 - k          # item 块：R 倒序 -> 序列时间正序
         if not has_user:
             return None, None
-        return False, k - (n - 1)           # user 块：正序
+        j = k - (n - 1)
+        if config.USER_SEQ_ORDER == "o_o":
+            return False, j                 # O_o：R 正序 -> 序列时间**倒序**
+        return False, n - 1 - j             # chrono：R 倒序 -> 序列时间正序
 
     n_u = n if has_user else 0
     len_R = (n - 1) + n_u

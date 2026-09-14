@@ -6,6 +6,7 @@
 特征分组照 O_o/dataset.py:834-848，**去掉数据里缺失的 '111'**。
 """
 import json
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -55,6 +56,18 @@ USER_FEAT_COLS = USER_SPARSE + USER_ARRAY
 
 # seq 缓存里 action 的取值：必须把「缺失 None」与「曝光 0」分开 —— 900 的映射不同
 ACT_EXPOSURE, ACT_CLICK, ACT_NONE = 0, 1, 2
+
+# user token 在序列里的先后次序。**这里只是默认值**，train.py 的 `--user_seq_order`
+# 优先于它（argparse 的 default 就是读的这个常量，所以环境变量不会被静默覆盖）。
+#   'o_o'    = 复刻 O_o：user 块在最终序列里是**时间倒序**（默认，行为不变）
+#   'chrono' = 按记录实际顺序：user 块时间正序，见 DIFF_vs_O_o.md §2.3
+# 两种切法：`--user_seq_order chrono`（推荐，会进 ckpt 的 args）/ `USER_SEQ_ORDER=chrono`。
+#
+# 模块级 assert 是刻意的：拼错取值必须**当场炸**，不能静默退回默认值 —— 否则一次
+# A/B 实验会白跑两小时才发现两边配置其实一样。
+USER_SEQ_ORDER = os.environ.get("USER_SEQ_ORDER", "o_o")
+assert USER_SEQ_ORDER in ("o_o", "chrono"), \
+    "USER_SEQ_ORDER 只能是 'o_o' / 'chrono'，实际 %r" % (USER_SEQ_ORDER)
 
 
 def action_to_900(a):

@@ -56,6 +56,24 @@ def append_jsonl(path, record):
         f.flush()
 
 
+def run_meta(epoch, train_sec, eval_sec, peak_gb):
+    """一次 epoch 的元信息（**不含**指标键）。`result.json` 与 `val.jsonl` 共用这一份，
+    避免只在一处记了某个字段、另一处漏掉。
+
+    `user_seq_order` 必须落在这里：`result.json` 每个 epoch 被重写、`val.jsonl` 是逐
+    epoch 追加的，两者都得能**脱离 ckpt 单独读懂**。`last.pt` 里虽然存了 `vars(args)`
+    （含 `--user_seq_order`），但要刨二进制才拿得到 —— 而且两种布局的指标不可直接比较，
+    事后才发现记错的代价是整轮训练白跑。
+
+    与指标合并由调用方 `{**run_meta(...), **val}` 完成（val 后展开，同名键以 val 为准）。
+    """
+    return {'epoch': epoch,
+            'train_sec': round(train_sec, 1),
+            'eval_sec': round(eval_sec, 1),
+            'peak_mem_gb': round(peak_gb, 2),
+            'user_seq_order': config.USER_SEQ_ORDER}
+
+
 def score_is_improvement(new_score, best_score):
     """早停的「更好」判据：非有限分一律不算更好。
 
@@ -81,6 +99,15 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--maxlen", type=int, default=101)
+    # default 取 config.USER_SEQ_ORDER（= 环境变量 USER_SEQ_ORDER 或 'o_o'），**不能**写死
+    # "o_o"：那样 `USER_SEQ_ORDER=chrono python train.py` 会被这里的默认值静默覆盖回 'o_o'，
+    # 环境变量看起来生效了、实际没生效。
+    p.add_argument("--user_seq_order", choices=["o_o", "chrono"],
+                   default=config.USER_SEQ_ORDER,
+                   help="user token 在序列里的先后次序（默认跟随环境变量 USER_SEQ_ORDER）。"
+                        "'o_o' = 复刻 O_o，user 块时间倒序；'chrono' = 按记录实际顺序，"
+                        "user 块时间正序。两种布局的指标不可直接比较，"
+                        "见 DIFF_vs_O_o.md §2.3")
     p.add_argument("--seed", type=int, default=20252026)
     p.add_argument("--embedding_dim", type=int, default=128)
     p.add_argument("--hidden_units", type=int, default=512)
@@ -200,6 +227,11 @@ def build_model(meta, args, device):
 
 def main():
     args = parse_args()
+    # 开关落在 config 上，而不是逐层传参：data.py 的 build_user_sample 是在 DataLoader
+    # 的 worker 进程里被调用的，透传要改 build_loaders / TowerDataset / build_user_sample
+    # 三层签名。**必须在 build_loaders 之前赋值** —— worker 是 fork 出来的，晚于它们启动
+    # 再改就已经是旧值了，而且不报错、只是静默跑错布局。
+    config.USER_SEQ_ORDER = args.user_seq_order
     auto_pick_gpu()          # 必须在 set_seed 之前：它内部会初始化 CUDA
     set_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -213,8 +245,11 @@ def main():
         val_log.parent.mkdir(parents=True, exist_ok=True)
     meta = config.load_meta(cache)
     device = torch.device("cuda")
-    print("[env] %s | amp=%s | batch=%d | workers=%d"
-          % (torch.cuda.get_device_name(0), args.amp, args.batch_size, args.num_workers),
+    # user_seq_order 打在这里：日志是唯一「扫一眼就知道这轮跑的哪套布局」的地方，
+    # 而两种布局的指标不可直接比较
+    print("[env] %s | amp=%s | batch=%d | workers=%d | user_seq_order=%s"
+          % (torch.cuda.get_device_name(0), args.amp, args.batch_size, args.num_workers,
+             config.USER_SEQ_ORDER),
           flush=True)
     # 打出来，省得事后找「这轮的逐 epoch 指标写哪去了」
     print("[log] 每 epoch 验证指标 -> %s"
@@ -372,9 +407,8 @@ def main():
 
         # 只留 last.pt + best.pt：单份 fp32 权重就 4.2GB，全存会吃掉磁盘
         with open(out_dir / "result.json", "w", encoding="utf-8") as f:
-            json.dump({'epoch': epoch, 'train_sec': round(t_eval - t0, 1),
-                       'eval_sec': round(eval_sec, 1), 'peak_mem_gb': round(peak_gb, 2),
-                       **val}, f, ensure_ascii=False, indent=2)
+            json.dump({**run_meta(epoch, t_eval - t0, eval_sec, peak_gb), **val},
+                      f, ensure_ascii=False, indent=2)
 
         ckpt = out_dir / "last.pt"
         torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args)}, ckpt)
@@ -385,8 +419,7 @@ def main():
         # 元信息用 update 补，避免将来 eval 那边多出一个同名的键就把这里打崩
         # —— 记录日志的代码不该有把训练搞挂的能力。
         rec_val = dict(val)
-        rec_val.update(epoch=epoch, train_sec=round(t_eval - t0, 1),
-                       eval_sec=round(eval_sec, 1), peak_mem_gb=round(peak_gb, 2),
+        rec_val.update(run_meta(epoch, t_eval - t0, eval_sec, peak_gb),
                        lr=optimizer.param_groups[0]['lr'], is_best=improved,
                        time=time.time())
         if val_log is not None:          # --val_log none/off 就是这一次不记
