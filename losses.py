@@ -1,4 +1,8 @@
-"""InfoNCE（+ -logQ 修正）与 SSL 对比损失，逐字对齐 O_o/main.py:100-225。
+"""InfoNCE（+ -logQ 修正）与 SSL 对比损失。
+
+默认参数下与 O_o/main.py:100-225 **逐字对齐**；唯一的偏离是 `info_nce` 的
+`easy_neg_logq` 开关（默认 True = 保持原样，关掉才偏离），详见那里与
+DIFF_vs_O_o.md §6.2 第 17 条。
 
 本模块只依赖 torch：不 import model / data / config，这样它能被单测直接驱动，
 也不会把模型的构造依赖带进损失测试。
@@ -16,12 +20,55 @@ import torch.nn.functional as F
 
 def info_nce(pos_embs, neg_embs, log_feats, temperature, next_token_type,
              next_action_type, pos_ids, neg_ids, item_logQ,
-             click_scale=1.0, exp_scale=0.1, filter_current_only=True):
+             click_scale=1.0, exp_scale=0.1, filter_current_only=True,
+             easy_neg_logq=True):
     """对齐 O_o/main.py:100-207。参数与返回同它，额外返回 sample_weight 便于单测。
 
     pos_ids / neg_ids / item_logQ 都是**必需**的：-logQ 修正不是可选项，
     它把「批内均匀负采样」的分布修回「按流行度采样」的目标分布。缺了它
     InfoNCE 会系统性地低估热门 item —— 静默变差，不报错，所以用从 O_o 抄来的断言拦住。
+
+    `easy_neg_logq`（默认 True = 保持 O_o 的写法）只管**易负那一族**的 -logQ。
+    为什么要做成开关：修正项的正确性取决于「该族的负样本是按什么分布采的」，
+    而三族的 proposal 并不相同 ——
+
+      | 族     | 列从哪来                        | proposal              |
+      |--------|---------------------------------|-----------------------|
+      | 正样本 | `pos_ids_flat`                  | 数据 ∝ counts         |
+      | 易负   | `neg_ids_pool`（`sample_neg` 采）| `counts ** neg_alpha` |
+      | 难负   | 批内其他序列的正样本            | 数据 ∝ counts         |
+
+    `prepare.build_logq` 写死的 `log(counts/total)` 对应的是**流行度**。所以：
+    - 正样本与难负**天生匹配**：两者的列都是数据里的 item，分布 ∝ counts；
+      而且 `logQ_pos` 与 `logQ_hard_cols` 逐位相等 —— 正样本本来就是「被屏蔽掉的
+      难负列」（`hard_neg_sim_full` 的对角元），共用一份修正是对的。
+    - 易负是唯一由 `--neg_pop_alpha` 决定分布的族。alpha=0 时 proposal 是**均匀**的，
+      此时正确的修正是常数 `log|pool|`（softmax 对整行加减常数不变 -> 等于不修正），
+      再减流行度的 logQ 就是**注入一个形状错误的偏置**，而不是「没修正」。
+
+    量级不小，用真实 `cache/logq.npy`（4,783,155 项）实测：`logQ` 的均值 **-17.20**、
+    std **1.39**、1%~99% 跨度 **5.67 nats**、全跨度 **11.08 nats**（min -18.32 / max
+    -7.24）。作为对照，模型自己的判别信号只有 `(mean_pos_sim - mean_neg_sim)/T ≈
+    (0.330 + 0.053)/0.025 ≈ 15.3 nats`（`logs/train.jsonl` 末尾）。也就是说 alpha=0 时，
+    易负那一族的列相对彼此的 logit 被频率主导到 std≈1.39、极差 11 nats 的程度 ——
+    **是模型判别信号的 9% / 72%，不是舍入误差那一档**。
+
+    两种修法都自洽，只是各自的单变量改动不同（见 config.EASY_NEG_LOGQ）：
+
+      - 关掉它（`--no-easy_neg_logq`）：让修正跟上「均匀」这个 proposal；
+      - 或把 `--neg_pop_alpha` 设成 1.0：让 proposal 跟上 `logq.npy`。
+
+    注意关掉它**不等于**「负样本不用管分布」：均匀采样本身是弱的选择（易负池被长尾
+    item 主导，而真实 softmax 分母的质量集中在 head），只是那样至少是自洽的。
+
+    顺带修掉一个隐患：`sample_neg` 放弃时返回 0（`data.py:130`）。item 0 的输入全零
+    —— `item_feat.npy` 第 0 行实测全 0，且每张 item 侧表的第 0 行都按 `padding_idx`
+    清零 —— 所以此时的 `neg_emb` 是**一个与样本无关的常数**（塔里 Linear 的 bias 决定）。
+    它的 logit = sim/T - logQ[0]，而 `logQ[0] = log(1e-12) = -27.63`，比典型列
+    （-17.20）高出 **10.4 nats ≈ 7.5σ**：一个零信息的常数列成了**最硬的那个易负**。
+    关掉修正后它拿 sim/T，不再有这个额外加成。实测不会触发（target 恒非 0，且 4.78M
+    的池子拒绝采样几乎不可能失败）；但隐患来自 `logQ[0]` 本身，所以把 alpha 调成 1.0
+    并不解除它 —— 只有这个开关会。
     """
     assert temperature > 0.0, "temperature must be > 0"
     assert item_logQ is not None, "item_logQ is required for -logQ correction"
@@ -54,10 +101,15 @@ def info_nce(pos_embs, neg_embs, log_feats, temperature, next_token_type,
     logQ_pos = item_logQ[pos_ids_flat].to(device=device, dtype=pos_sim.dtype).unsqueeze(1)
     pos_logits = (pos_sim / temperature) - logQ_pos                       # [M,1]
 
-    # 批内「易负样本」池 logits：sim/T - logQ[neg_column]
+    # 批内「易负样本」池 logits：sim/T（- logQ[neg_column]，见 easy_neg_logq）
+    # 这一族是**唯一**由 --neg_pop_alpha 决定采样分布的：alpha=0 时 proposal 均匀，
+    # 正确的修正是个整行常数（softmax 不变 -> 等于不修正），此时再减流行度的 logQ
+    # 就是把「item 频率」灌进 logits。默认 True 保持 O_o 的写法不变。
     neg_sim = Qn @ Knegn.t()                                              # [M,M]
-    logQ_cols = item_logQ[neg_ids_pool].to(device=device, dtype=neg_sim.dtype)
-    neg_logits = (neg_sim / temperature) - logQ_cols.unsqueeze(0)         # [M,M]
+    neg_logits = neg_sim / temperature                                    # [M,M]
+    if easy_neg_logq:
+        logQ_cols = item_logQ[neg_ids_pool].to(device=device, dtype=neg_sim.dtype)
+        neg_logits = neg_logits - logQ_cols.unsqueeze(0)
 
     # 点击/曝光样本级权重。**必须归一化到和为 1**：否则 click_scale 就是个全局
     # 学习率乘子，改它等于偷偷改 lr（O_o 在这点上踩过坑）。
@@ -137,12 +189,13 @@ def ssl_loss(z1, z2, temperature):
 def init_weights(m):
     """对齐 O_o/main.py:83-95。
 
-    padding 行只对**声明了 padding_idx 的表**清零：`hstu.time` 是一张
-    nn.Embedding(129, 1) 但 padding_idx=None，它第 0 行是「对角线自连接」这个真实
-    可学习参数（model.py:149 手工 normal_(std=0.02)），不能被清零。
+    padding 行只对**声明了 padding_idx 的表**清零：`hstu` 的相对时间偏置表是一张
+    nn.Embedding(129, 1) 但 padding_idx=None（每层一张时是 `time_layers` 里的 8 张，
+    同样不声明），它第 0 行是「对角线自连接」这个真实可学习参数（构造时手工
+    normal_(std=0.02)），不能被清零。
 
     因为这里给 Embedding 的统一初始化就是 N(0, 0.02)，与那行手写初始化**完全一致**，
-    所以 apply 之后不需要再单独排除 self.time；也不需要在外面额外做一遍
+    所以 apply 之后不需要再单独排除它们；也不需要在外面额外做一遍
     「把 item_emb[0]/user_emb[0]/sparse_emb[k][0] 清零」——本函数的 padding_idx
     分支已经覆盖，且我们的每张表都声明了 padding_idx=0。
     """
