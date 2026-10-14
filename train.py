@@ -96,6 +96,16 @@ def run_meta(epoch, train_sec, eval_sec, peak_gb, args=None):
     改的是模型里有没有那 8 张表。它比别的开关更容易漏记 —— 参数总量、张量形状、ckpt
     的可加载性全都不变，只有指标会不一样。
 
+    `trope` / `trope_shifted_query` 是**第四路注意力**的开关（见 config.TROPE）。它们是
+    这里唯一会**改张量形状**的开关：`uqkv` 从 `Linear(D, 6D)` 变 `Linear(D, 7D)`、FFN 输入
+    从 3D 变 4D，所以两轮的 ckpt **不能互相加载**（`load_state_dict` 会直接报 size
+    mismatch）。`trope=False` 是个「看着很正常」的默认值，所以「日志里没有这个键」与
+    「日志里是 False」仍然必须分得开（测试两个方向都钉）。
+
+    第四路的**时间原点不在这里** —— 它固定为「逐序列居中」（`tower.forward` 里减掉每条
+    序列第一个有效 token 的时间），不是参数，所以没有 `trope_t0` 这个键。（曾经有过一版
+    全局原点的实现并废弃，理由见 `config.TROPE` 的注释。）
+
     与指标合并由调用方 `{**run_meta(...), **val}` 完成（val 后展开，同名键以 val 为准）。
     """
     if args is None:
@@ -108,7 +118,9 @@ def run_meta(epoch, train_sec, eval_sec, peak_gb, args=None):
                                   moe_bias_gamma=config.MOE_BIAS_GAMMA,
                                   moe_ffn_act=config.MOE_FFN_ACT,
                                   easy_neg_logq=config.EASY_NEG_LOGQ,
-                                  time_bias_per_layer=config.TIME_BIAS_PER_LAYER)
+                                  time_bias_per_layer=config.TIME_BIAS_PER_LAYER,
+                                  trope=config.TROPE,
+                                  trope_shifted_query=config.TROPE_SHIFTED_QUERY)
     return {'epoch': epoch,
             'train_sec': round(train_sec, 1),
             'eval_sec': round(eval_sec, 1),
@@ -123,7 +135,9 @@ def run_meta(epoch, train_sec, eval_sec, peak_gb, args=None):
             'moe_bias_gamma': args.moe_bias_gamma,
             'moe_ffn_act': args.moe_ffn_act,
             'easy_neg_logq': args.easy_neg_logq,
-            'time_bias_per_layer': args.time_bias_per_layer}
+            'time_bias_per_layer': args.time_bias_per_layer,
+            'trope': args.trope,
+            'trope_shifted_query': args.trope_shifted_query}
 
 
 def score_is_improvement(new_score, best_score):
@@ -240,6 +254,21 @@ def parse_args():
                         "打开后每层一张（8 张 × 129 行 = 1032 个参数）。桶的定义、初始化、"
                         "三路拼接都不变，只改「几张表」—— 但两档的指标不可直接比较，"
                         "务必同时换 OUT_DIR/OUT_LOG，见 config.TIME_BIAS_PER_LAYER")
+    p.add_argument("--trope", action=argparse.BooleanOptionalAction,
+                   default=config.TROPE,
+                   help="在 HSTU block 的三路注意力（content / RoPE / 相对时间表×V）之外"
+                        "**追加**第四路：用时间戳旋转 Q/K 再走同样一条注意力（model.Trope）。"
+                        "默认关（= 与 O_o 逐位一致的三路）。注意它是**唯一会改张量形状**的"
+                        "开关：uqkv 6D->7D、FFN 输入 3D->4D（1536->2048），所以两轮的 ckpt "
+                        "**不能互相加载**（会直接报 size mismatch）。代价：注意力矩阵乘 +50%、"
+                        "FFN +33%、参数 +3.3%，见 config.TROPE。"
+                        "两轮指标不可直接比较，换档务必同时换 OUT_DIR")
+    p.add_argument("--trope_shifted_query", action=argparse.BooleanOptionalAction,
+                   default=config.TROPE_SHIFTED_QUERY,
+                   help="第四路的 query 用「下一个事件」的时间戳旋转（最后一个 slot 没有"
+                        "下一个事件，退化成用自己）。只在 --trope 打开时生效（关着时一个参数"
+                        "都不建）。默认关 = 保持 model.Trope 的源语义；它与 --trope 是两个"
+                        "变量，不要合成一次实验")
     p.add_argument("--ssl_alpha", type=float, default=0.5)
     p.add_argument("--ssl_mask_ratio", type=float, default=0.6)
     p.add_argument("--num_workers", type=int, default=12)
@@ -349,13 +378,17 @@ def build_model(meta, args, device):
                                  routed_scale=args.moe_routed_scale,
                                  balance=args.moe_balance,
                                  ffn_act=args.moe_ffn_act,
-                                 time_bias_per_layer=args.time_bias_per_layer)
+                                 time_bias_per_layer=args.time_bias_per_layer,
+                                 trope=args.trope,
+                                 trope_shifted_query=args.trope_shifted_query)
     model = tower(**kwargs).to(device)
     # init_weights 会给每个 nn.Linear 装 xavier —— 路由权重是**裸 Parameter**，
     # 因此不受影响、保持零初始化（初始门控精确等于 1/E 的来源，见 model.py 的 moe）。
     # 共享专家**是** nn.Linear，所以这里照常吃到 xavier，正是它该有的初始化。
     # λ（routed_scale）是 python float、不是 buffer/Parameter，init_weights 碰不到它，
     # state_dict 里也没有它的键 —— 这是「同一份权重配不同 λ」能成立的前提。
+    # `Trope` 的 α（q_coef / k_coef）与路由权重同处境：裸 Parameter，init_weights 不碰，
+    # 保持 N(0, σ=1) 的初始化。
     model.apply(losses.init_weights)
     return model
 
@@ -385,12 +418,13 @@ def main():
     print("[env] %s | amp=%s | batch=%d | workers=%d | user_seq_order=%s"
           " | moe=%dx top%d shared%d scale=%s balance=%s gamma=%s alpha=%s ffn_act=%s"
           " | neg_pop_alpha=%s | easy_neg_logq=%s"
-          " | time_bias_per_layer=%s"
+          " | time_bias_per_layer=%s | trope=%s shifted=%s"
           % (torch.cuda.get_device_name(0), args.amp, args.batch_size, args.num_workers,
              config.USER_SEQ_ORDER, args.moe_experts, args.moe_topk,
              args.moe_shared_experts, args.moe_routed_scale, args.moe_balance,
              args.moe_bias_gamma, args.moe_aux_alpha, args.moe_ffn_act,
-             args.neg_pop_alpha, args.easy_neg_logq, args.time_bias_per_layer),
+             args.neg_pop_alpha, args.easy_neg_logq, args.time_bias_per_layer,
+             args.trope, args.trope_shifted_query),
           flush=True)
     # 打出来，省得事后找「这轮的逐 epoch 指标写哪去了」
     print("[log] 每 epoch 验证指标 -> %s"

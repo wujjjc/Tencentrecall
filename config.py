@@ -6,6 +6,7 @@
 特征分组照 O_o/dataset.py:834-848，**去掉数据里缺失的 '111'**。
 """
 import json
+import math
 import os
 from pathlib import Path
 
@@ -233,6 +234,82 @@ EASY_NEG_LOGQ = True
 # 是另一个实验，别和这个一起开。
 TIME_BIAS_PER_LAYER = False
 
+# 第四路注意力：把 `model.Trope`（用时间戳旋转 Q/K）作为**第四路**接进 HSTU block 的三路
+# 注意力（content / RoPE / 相对时间表 × V），打开后 `out = cat([attn, rope, time, trope])`
+# 是 4·d，而不是现在的 3·d。
+#
+#   TROPE = False（默认）= 一个参数都不建、`uqkv` 仍是 `nn.Linear(D, 6D)`、FFN 输入仍是
+#                          3D —— **与改动前逐位一致**，也是与 O_o 对齐的那一档
+#                          （O_o 只有三路，见 DIFF_vs_O_o.md §2.6）
+#   TROPE = True          = 每个 block 多一路 trope 注意力 + 一个自己的 Trope 模块
+#
+# 它是**结构**开关，且是这里唯一会改张量形状的：`uqkv` 的输出从 6D 变 7D（只多一块 U），
+# FFN 的输入从 3D 变 4D（1536 -> 2048）。所以两轮的 ckpt **不能互相加载**，
+# `load_state_dict` 会直接报 size mismatch —— 比 `--moe_ffn_act` 那种「键名不匹配」更好认，
+# 但仍然是不可比的两套权重。换档务必同时换 OUT_DIR。
+#
+# 代价（实测前的核算，落地后要复核）：
+#   参数  uqkv +D²/层（+2.10M）；FFN 输入 1536->2048，每个专家 +512²，E=16 时 +4.19M/层
+#         -> 合计约 +35.6M（1.083B -> ~1.119B，+3.3%）
+#   FLOPs QK^T + AV 从 2 路变 3 路（注意力矩阵乘 +50%）；FFN MACs/token +33%
+#   显存  FFN 激活按 +33% 估；当前 --trope 关闭档的实测峰值是 50.4GB（logs/result.json）
+#
+# 三条语义要点，都写进了 model.py 的 Trope docstring：
+#   1. 依赖的是 `t_i + t_j` 不是 `t_i − t_j`（来自 `k_pos = -k_pos`），只有 α_q 学到
+#      ≈ −α_k 时才退化成相对时间 —— 已知且接受，有单测正面钉住
+#   2. 喂进去的时间戳是**居中的**（tower.forward 里减去每条序列首个有效 token 的时间），
+#      因为绝对 Unix 秒在 fp32 下只有 ~128 秒的分辨率
+#   3. 与第三路（rel_ts 偏置 × V）都编码时间，两者**暂时共存**；是否关掉第三路是下一步
+TROPE = False
+
+# trope 那一路的 query 要不要用「下一个事件」的时间戳（最后一格退化成用自己）。
+# 与本仓库 next-item 预测的目标更贴，但源码默认是 False，这里也保持 False ——
+# 把它留成下一档 A/B，不要和 TROPE 本身混成一次实验。
+TROPE_SHIFTED_QUERY = False
+
+# Trope 的 β 刻度范围（**不可学**，对数等分成 p 个平面）。
+# 第 p 个平面的周期是 `2π·β_p/α_p`，α 初始 N(0, σ=1) 所以起步 ≈ `2πβ_p`；
+# 取 β = 周期/2π 就能让周期直接等于想要的秒数。
+#
+# 取值依据（**实测**，不再照抄 FourierTimeEncoding 的 1~40 天）：
+#   - 判据是「这条序列内部扫过几个整周期」。因为相位依赖 `t_i + t_j` 而不是差值，
+#     序列内的变化量是 `2W`（W = 序列内时间跨度），所以 `周期数 = 2W / P`。
+#   - 实测 W：p10 = 13.8 天、**中位 26.8 天**、p90 = 73.7 天、均值 38.2 天。
+#   - 快端留 1 天：给细粒度分辨率（约 0.5 rad/小时），混叠不影响它当高频特征用。
+#   - 慢端取 **180 天 ≈ 2 × W(p90)**，让最慢的平面在中位用户上只扫过 0.30 个周期 ——
+#     否则没有任何一个平面能单调分辨「这条记录离窗口开头多久」。
+#     （慢端 40 天时最慢平面也要绕 1.34 圈，32 个平面里只有 4 个在 2 圈以内。）
+#
+# 类里原本写死的是 `100` / `1e8`，换算成周期是 ~10 分钟 ~ ~20 年 —— 一半平面在本数据的
+# 会话尺度上几乎不动、另一半快到按秒混叠，所以这里重标定。注意这是**纯正值重标定**：
+# β 不可学，把它整体除以 2π 与在 forward 里多乘一个 2π 完全等价（α 学得回来）。
+#
+# ⚠️ β 只决定这个先验，**α 是可学的**（`P = 2πβ/α`），模型能把每个平面拉长或压短
+# 1~2 个数量级。所以这套数偏了也不会让实验作废，只是初始化离中心远一点。
+TROPE_BETA_MIN_SEC = 86400.0 / (2 * math.pi)              # ≈ 13 751，周期 1 天
+TROPE_BETA_MAX_SEC = 180 * 86400.0 / (2 * math.pi)        # ≈ 2 475 176，周期 180 天
+
+# 第四路的时间原点：**不做成开关**，固定为「每条序列减掉自己第一个有效 token 的时间」
+# （见 `model.tower.forward` 里 `rot_ts` 的构造）。
+#
+# 为什么两个「减」都需要：fp32 下 1.7e9 的 ulp 是 **128 秒**，相邻很近的两条行为会不可分；
+# 减掉原点后取值落到会话跨度（实测中位 26.8 天、p90 73.7 天），ulp 降到 **2 秒**。
+#
+# 曾经有一版是「减掉数据集最早一条记录」（1728921670），**实测后废弃**，理由与证据：
+#   - 那样每条序列自带一项 `(α_k+α_q)·T_user/β` 的常数相位，`T_user` 是会话在数据集里的
+#     绝对位置，**逐用户随机**。快平面（β=13751）在 231.3 天上扫过 ~2900 rad（≈460 整周期），
+#     连最慢的平面（180 天周期）也要绕 ~1.7 圈 —— 所有平面都中招，且这一项比信号项还大。
+#   - 后果是 `Δ → 注意力权重` 的映射逐用户不一致，梯度互相抵消：α 训练前后几乎没动
+#     （`|α|` 均值 0.62~0.97，正对上 `N(0,1)` 初始化的 `E|α| = 0.798`），best.pt(ep4) 与
+#     last.pt(ep6) 逐位几乎相同，死平面只有 1~7 个。
+#   - 指标上：6 epoch 的 best score 0.095115 vs 不加第四路的基线 0.094985，只差 +0.14%，
+#     在噪声内。
+# 详见 `DIFF_vs_O_o.md` §2.6 与 `model.Trope` 的 docstring。
+#
+# ⚠️ 逐序列居中的代价：原点会随 `--user_seq_order` 变。`o_o` 的 user 块是时间倒序，首位
+# 拿到的是 user 块里**最新**的那条；`chrono` 下首位是最旧的（= 窗口开头）。本仓库的正式
+# 跑都用 `chrono`。
+
 
 def action_to_900(a):
     """O_o/dataset.py:439 _map_action_to_id：None->0, 曝光->1, 点击->2。"""
@@ -268,14 +345,20 @@ def tower_kwargs(meta, embedding_dim=128, hidden_units=512, dropout=0.2,
                  num_shared=MOE_SHARED_EXPERTS,
                  routed_scale=MOE_ROUTED_SCALE,
                  balance=MOE_BALANCE,
-                 ffn_act=MOE_FFN_ACT):
+                 ffn_act=MOE_FFN_ACT,
+                 trope=TROPE,
+                 trope_shifted_query=TROPE_SHIFTED_QUERY):
     """按 prepare.py 写出的词表规模生成 tower 的构造参数。
 
     每张表的行数 = 该特征的词表规模 + 1（0 号行是 pad）。
     num_experts / top_k 是 MoE 的开关，num_shared 是共享专家的个数，
     routed_scale 是路由支路的系数 λ，time_bias_per_layer 是相对时间偏置表的开关，
-    balance 是负载均衡策略，ffn_act 是 FFN 的激活函数（默认都取本模块的常量，
-    见那里的说明）。
+    balance 是负载均衡策略，ffn_act 是 FFN 的激活函数，trope / trope_shifted_query 是
+    第四路时间旋转注意力的开关（默认都取本模块的常量，见那里的说明）。第四路的时间
+    原点不是参数：固定为逐序列居中，见 `TROPE` 那段注释。
+
+    ⚠️ 默认值在 `def` 求值时绑定模块常量，所以 `monkeypatch.setattr(config, "TROPE", ...)`
+    **不会**改变本函数的行为 —— 与其它开关同构，测试要显式传参。
     """
     fv = meta["feat_vocab"]
     return dict(
@@ -293,4 +376,6 @@ def tower_kwargs(meta, embedding_dim=128, hidden_units=512, dropout=0.2,
         balance=balance,
         ffn_act=ffn_act,
         time_bias_per_layer=time_bias_per_layer,
+        trope=trope,
+        trope_shifted_query=trope_shifted_query,
     )

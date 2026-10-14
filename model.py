@@ -2,6 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import config
 class glu(nn.Module):
     """门控特征交互块，逐字等于 O_o 的 `FeatureInteractionEncoder`（O_o/model.py:257-285）。
 
@@ -129,6 +131,144 @@ def _make_ffn(input_dim, output_dim, act):
         _FFN_ACT[act](),
         nn.Linear(output_dim, output_dim),   # W2
     )
+
+
+class Trope(nn.Module):
+    """时间旋转位置编码：用**时间戳**（而不是位置下标）去旋转 Q / K。
+
+    与 `rope()` 的形状契约完全一致 —— 输入 `[b, head, s, d]`，`q[..., ::2]` 当实部、
+    `q[..., 1::2]` 当虚部，末尾 `stack([real, imag]).flatten(-2)` 还原成交错布局。差别只在
+    「旋转角由什么算出来」：
+
+        rope : φ_p(i) = i / base^(2p/d)            i 是位置下标
+        Trope: φ_p(t) = α_p · t / β_p              t 是时间戳
+
+    **⚠️ 相位依赖的是 `t_i + t_j`，不是 `t_i − t_j`。** 按上面的复数约定，旋转之后注意力在
+    第 p 个平面上的相位是
+
+        φ = φ_k' − φ_q = −(α_k·t_j + α_q·t_i) / β        （来自下面那句 `k_pos = -k_pos`）
+
+    而标准 RoPE（以及本文件的 `rope()`）依赖的是 `θ_j − θ_i`。要让这里退化成相对时间 Δ，
+    需要 α_q 学到 ≈ −α_k —— 两者是**独立初始化**的 N(0, σ)，没有任何东西把它们拉向相反。
+    这一点由 `tests/test_trope.py::test_the_kernel_depends_on_the_sum_not_the_difference`
+    正面钉住：**别把这个负号当 bug 修掉**，它是已知且被告知过的语义选择。推导见
+    `DIFF_vs_O_o.md` §2.6。
+
+    β 是**不可学**的、对数等分的。第 p 个平面的周期是 `2π·β_p/α_p`，α 初始 N(0, σ) 所以起步
+    ≈ `2πβ_p`；取值见 `config.TROPE_BETA_MIN_SEC` / `TROPE_BETA_MAX_SEC`（默认周期
+    **1 天 ~ 180 天**）。它是 buffer，不是每次前向重算 —— 原来那版在 forward 里做
+    `exp(log(...))`，8 层 × 每步 5 次前向地重建同一张表。
+
+    那个 180 天不是照抄 `FourierTimeEncoding` 的 40 天，是按实测定的：判据是「序列内扫过几个
+    整周期」= `2W / P`（`2W` 来自和值依赖，W 是序列内时间跨度，实测中位 26.8 天、p90 73.7 天）。
+    慢端取 2×W(p90) 才能让最慢的平面不绕圈；快端留 1 天是给细粒度分辨率用。详见
+    `config.TROPE_BETA_MAX_SEC` 的注释。
+
+    **传进来的 `t` 必须是居中的时间戳**（`tower.forward` 里减掉每条序列第一个有效 token 的
+    时间），不是裸 Unix 秒，也不是「减掉数据集全局原点」。两条理由：
+
+      - `t` 会被转成 fp32，而 1.7e9 在 fp32 下的 ulp 是 **128 秒**，相隔更近的两条行为会
+        不可分（原稿只说了「BF16 下只剩 3 位有效数字」，但 fp32 这一头的损失同样真实）；
+        减掉原点后取值落到会话跨度（实测中位 26.8 天），ulp 降到 **2 秒**。
+      - 不减的话每对 (i, j) 的相位都被 `2·t_abs` 这个巨大常数主导，而它对所有点对是同一个
+        值，等于白白抬高了相位；（和值依赖下）只有相对原点的那部分才携带信息。
+
+    **为什么必须是「逐序列」而不是「全局原点」** —— 相位可以拆成
+
+        φ = −[(α_k + α_q)·T_user  +  α_k·δ_j + α_q·δ_i] / β
+
+    `T_user` = 会话在数据集里的绝对位置，`δ` = 会话内偏移。
+
+      - 逐序列居中：`T_user ≡ 0`（按构造），第一项消失 ⇒ 同一个 `Δ` 对所有用户给出同一个
+        相位 ⇒ `Δ → 权重` 的映射可学且共享。
+      - 全局原点：`T_user` 逐用户随机。快平面（β = 13751，`dφ/dt ≈ 7.3e-5 rad/s`）在
+        231.3 天的跨度上扫过 `2 × 7.3e-5 × 2.0e7 ≈ 2900 rad`（≈460 个整周期），连最慢的
+        平面（180 天周期）也要绕 ~1.7 圈 —— **所有平面都中招**。而且这一项（150 天量级）
+        比信号项（0~27 天）还大，不只是噪声而是压过信号的噪声。
+
+    实测（2026-10-13 那轮 6-epoch 全量跑，见 `docs/superpowers/plans/2026-10-12-taac-trope
+    -fourth-branch.md`）：用全局原点时 α **训练前后几乎没动** —— `|α|` 均值 0.62~0.97，
+    正对上 `N(0, σ=1)` 初始化的 `E|α| = 0.798`；`best.pt`(ep4) 与 `last.pt`(ep6) 逐位几乎
+    相同；死平面只有 1~7 个（不是「模型关掉了它们」，是没有可用的梯度）。这就是上面那条
+    「梯度互相抵消」的直接证据，所以换回逐序列居中。
+
+    pad 位置不需要特殊处理：那里的 Q / K 恒为 0（`uqkv` 是 `bias=False` 的 Linear + SiLU，
+    零输入给零输出），旋转零向量还是零向量。
+
+    `grad_clip`（默认 True = 夹到范数 1.0）挂在 `post_accumulate_grad_hook` 上：
+    `∂cos(αt/β)/∂α ~ t/β`，居中的 t 仍有 1e5 量级，所以**几乎每一步都会触发** —— α 因此
+    拿到的是定长更新，与真实梯度大小脱钩。这是已知的、刻意保留的行为（原稿 PATCH 4），
+    比「偶尔才夹」更可预测，但别指望从 α 的更新量里读出梯度信息。
+    """
+    def __init__(self, dim, sigma=1.0, shifted_query=False, grad_clip=True,
+                 beta_min=config.TROPE_BETA_MIN_SEC, beta_max=config.TROPE_BETA_MAX_SEC):
+        super().__init__()
+        self.dim = dim
+        self.p = dim // 2
+        assert dim % 2 == 0, "rotary dim 必须是偶数，实际 %d" % (dim,)
+        assert self.p >= 2, "至少需要 2 个旋转平面（dim>=4），实际 dim=%d" % (dim,)
+        assert 0 < beta_min < beta_max, \
+            "beta 必须满足 0 < beta_min < beta_max，实际 (%r, %r)" % (beta_min, beta_max)
+        self.shifted_query = shifted_query
+        self.grad_clip = grad_clip
+
+        self.q_coef = nn.Parameter(torch.empty(self.p).normal_(mean=0.0, std=sigma))
+        self.k_coef = nn.Parameter(torch.empty(self.p).normal_(mean=0.0, std=sigma))
+        # β 是对数等分的 **不可学** 刻度；注册成 buffer 让它跟着 .to(device) 走，
+        # 也不必每次前向重建。**只有开了 trope 才会存在这个键**（见 hstublock.n_branches）。
+        self.register_buffer("beta", torch.logspace(math.log10(beta_min), math.log10(beta_max),
+                                                    steps=self.p))
+
+        if grad_clip is not None:
+            def _clip(prm, _max=grad_clip):
+                # ⚠️ `clip_grad_norm_` **返回**裁剪前的总范数（0-dim tensor）。而
+                # `post_accumulate_grad_hook` 的返回值会被当成新的 `.grad` —— 直接把它的
+                # 返回值交出去，等于把形状 [p] 的梯度换成一个标量，backward 当场抛
+                # "hook '<lambda>' has changed the size of value"（冒烟实测）。
+                # 所以必须调用后丢弃返回值。
+                torch.nn.utils.clip_grad_norm_([prm], _max)
+
+            for param in (self.q_coef, self.k_coef):
+                param.register_post_accumulate_grad_hook(_clip)
+
+    def forward(self, q, k, t):
+        # q: [b, head, s, d] k: [b, head, s, d] t: [b, s] **居中的**时间戳（秒，相对参考点）
+        model_dtype = q.dtype
+        q_base = self.q_coef / self.beta   # [d/2]   = alpha_q / beta
+        k_base = self.k_coef / self.beta   # [d/2]   = alpha_k / beta
+
+        # t 强制走 FP32：BF16 下时间戳会被打死（原稿的理由），fp32 下则只剩 128 秒的
+        # 分辨率 —— 后者正是调用方要先把 t 居中的原因，不要在 forward 里替它「补救」。
+        pos = t.to(torch.float32).unsqueeze(-1)                 # [b, s, 1]
+
+        q_pos = (pos * q_base.unsqueeze(0).unsqueeze(0)).unsqueeze(1)  # [b, 1, s, d/2]
+        k_pos = (pos * k_base.unsqueeze(0).unsqueeze(0)).unsqueeze(1)  # [b, 1, s, d/2]
+
+        # 平移查询对齐：位置 m 的 query 用「下一个事件」的时间旋转；最后一个 slot 没有
+        # t_{s+1}，保留自身时间戳（推理时把该 slot 的 t 填成当前时刻 t_now 即可）。
+        if self.shifted_query:
+            q_pos = torch.roll(q_pos, shifts=-1, dims=2)
+            q_pos[:, :, -1, :] = (pos[:, -1, :] * q_base).unsqueeze(1)  # 复原最后一位
+
+        # nonstationary key: R(phi)^T，等价于绕 -phi 旋转。**这一句是「依赖和值」的来源**
+        # ——见类 docstring，别顺手删。
+        k_pos = -k_pos
+
+        # ⚠️ 必须是 `...` 而不是 `[:, :]`：`q[:, :, ::2]` 在 [b, head, s, d] 上切的是
+        # **序列维**，会与 [b, 1, s, d/2] 的相位广播不开。（这个 bug 让本类一次都没跑通过。）
+        q1, q2 = q[..., ::2], q[..., 1::2]                      # [b, head, s, d/2]
+        k1, k2 = k[..., ::2], k[..., 1::2]                      # [b, head, s, d/2]
+
+        q_real = q1 * torch.cos(q_pos) - q2 * torch.sin(q_pos)
+        q_imag = q1 * torch.sin(q_pos) + q2 * torch.cos(q_pos)
+        k_real = k1 * torch.cos(k_pos) - k2 * torch.sin(k_pos)
+        k_imag = k1 * torch.sin(k_pos) + k2 * torch.cos(k_pos)
+
+        output_q = torch.stack([q_real, q_imag], dim=-1).flatten(-2)   # [b, head, s, d]
+        output_k = torch.stack([k_real, k_imag], dim=-1).flatten(-2)   # [b, head, s, d]
+
+        # cast 回模型 dtype，否则会把后续 matmul 拉回 FP32
+        return output_q.to(model_dtype), output_k.to(model_dtype)
 
 
 class moe(nn.Module):
@@ -512,16 +652,44 @@ class moe(nn.Module):
 
 
 class hstublock(nn.Module):
+    """一个 HSTU block：三路注意力（content / RoPE / 相对时间表×V）+ FFN，post-norm 残差。
+
+    **第四路（`trope=True`）**：在第三路之后**追加**一路用时间戳旋转 Q/K 的注意力
+    （`model.Trope`）。注意这是**净新增**，不是替换 —— 原来三路一个字都不动。
+
+    开关会改变两个维度，这是本仓库唯一会改张量形状的结构开关：
+
+        uqkv 的输出   input_dim * 6  ->  input_dim * 7      （只多一块 U，Q/K/V 共用）
+        FFN 的输入    input_dim * 3  ->  input_dim * 4      （1536 -> 2048）
+
+    代价写在 `config.TROPE` 那里。默认关闭时必须**逐字**走改动前那条路径 ——
+    `tests/test_model_equiv.py` 按 `6*Dn` 切 uqkv、按 `3*Dn` 算 FFN 输入去与 O_o 比对，
+    那里一行都不能改。
+    """
     def __init__(self, input_dim, head, num_experts=1, top_k=1, num_shared=0,
-                 routed_scale=1.0, balance="aux_loss", ffn_act="none"):
+                 routed_scale=1.0, balance="aux_loss", ffn_act="none",
+                 trope=False, trope_shifted_query=False):
         super(hstublock, self).__init__()
+        # **`trope` / `trope_shifted_query` 必须留在最后**：`tests/test_ffn_act.py` 有两条
+        # 用例是按位置传满 8 个参数并断言某个槽位上的值的，插到中间会在构造期就 TypeError。
+        assert input_dim % head == 0, "input_dim 必须能被 head 整除"
+        assert (input_dim // head) % 2 == 0, \
+            "每个 head 的维度必须是偶数（Trope 要两两成旋转平面），实际 %d" % (input_dim // head)
+        self.n_branches = 3 + int(trope)          # 拼接后喂给 FFN 的支路数
         self.uqkv = nn.Sequential(
-            # u: 3 * input_dim, q: input_dim, k: input_dim, v: input_dim
-            nn.Linear(input_dim, input_dim * 6, bias=False),  # O_o/model.py:186
+            # u: n_branches * input_dim, q: input_dim, k: input_dim, v: input_dim
+            # 写成 `3 + n_branches` 而不是字面量 6 / 7，是为了让「关闭档 == 改动前」这件事
+            # 在代码里一眼可读。
+            nn.Linear(input_dim, input_dim * (3 + self.n_branches), bias=False),  # O_o/model.py:186
             nn.SiLU()
         )
         self.head = head
         self.norm = nn.RMSNorm(input_dim, eps=1e-8)  # O_o/model.py:182
+        # 每个 block 一份自己的 Trope，**跨 8 个 head 共享**（Trope 内部对 head 维广播），
+        # 所以粒度是 per-layer：每层 2 × (d/2) = 64 个参数，8 层共 512 个。
+        # 关掉时**不建任何参数** —— 与 `self.shared = None` 同一条既有约定。
+        self.trope = (Trope(input_dim // head, shifted_query=trope_shifted_query)
+                      if trope else None)
         # num_experts=1 走原来的 nn.Linear：与 O_o 逐位等价（test_model_equiv 靠它），
         # 也是 A/B 的「关掉 MoE」那一档。>1 时才是带路由的 MoE。
         #
@@ -537,18 +705,20 @@ class hstublock(nn.Module):
         assert not (balance != "aux_loss" and num_experts <= 1), \
             "balance != 'aux_loss' 需要 num_experts>1（否则 FFN 是 nn.Linear，偏置会被静默忽略）"
         self.has_moe = num_experts > 1
-        self.ffn = (moe(input_dim * 3, input_dim, num_experts, top_k, num_shared,
+        self.ffn = (moe(input_dim * self.n_branches, input_dim, num_experts, top_k, num_shared,
                         routed_scale, balance, ffn_act)
-                    if self.has_moe else _make_ffn(input_dim * 3, input_dim, ffn_act))
+                    if self.has_moe
+                    else _make_ffn(input_dim * self.n_branches, input_dim, ffn_act))
 
-    def forward(self, x, mask, rel_ts):
+    def forward(self, x, mask, rel_ts, rot_ts=None):
         # x: [b, s, input_dim]  mask: [b, s, s] True=屏蔽  rel_ts: [b, s, s] 相对时间偏置
+        # rot_ts: [b, s] 第四路要的**居中时间戳**（开了 trope 时必须有，见 tower.forward）
         # 返回 (输出, 负载均衡项)——aux 走返回值而不是 self.ffn.aux 这类属性引用：
         # 属性会把带 grad_fn 的标量（连同它引用的图）留到下一次前向才被覆盖，
         # 在 no_grad 之外的前向里等于多留一份反向图。
         U, Q, K, V = torch.split(
             self.uqkv(x), 
-            [x.shape[-1] * 3, 
+            [x.shape[-1] * self.n_branches, 
             x.shape[-1], 
             x.shape[-1],
             x.shape[-1]
@@ -574,7 +744,24 @@ class hstublock(nn.Module):
         rope_attn = torch.relu(rope_attn) # [b, head, s, s]
         rope_out = torch.matmul(rope_attn, V) # [b, head, s, d]
         rope_out = rope_out.transpose(1, 2).contiguous().view(x.shape[0], x.shape[1], -1) # [b, s, d]
-        out = torch.cat([attn_out, rope_out, time_out], dim=-1) # [b, s, 3 * d]
+
+        # ---- 第四路（可选）：用时间戳旋转 Q/K 再走同样一条注意力 ----
+        # 归一化量、屏蔽、relu、乘 V 都与前两路**逐字一致**，只有旋转角的来源不同。
+        branches = [attn_out, rope_out, time_out]
+        if self.trope is not None:
+            # 时间戳是 Int64 -> 没有梯度，但缺少它意味着上层没透传 —— 不打招呼地退化成
+            # 「无时间旋转」会让一次 A/B 白跑，所以当场炸。
+            assert rot_ts is not None, \
+                "开了 trope 但没拿到 rot_ts（第四步的时间戳没从上透传下来）"
+            q_tr, k_tr = self.trope(Q, K, rot_ts)
+            trope_attn = torch.matmul(q_tr, k_tr.transpose(-2, -1)) / Q.shape[-2]
+            trope_attn = torch.masked_fill(trope_attn, mask.unsqueeze(1), float('0'))
+            trope_attn = torch.relu(trope_attn)
+            trope_out = torch.matmul(trope_attn, V)
+            trope_out = trope_out.transpose(1, 2).contiguous().view(x.shape[0], x.shape[1], -1)
+            # **追加在末尾**（而不是插进中间），让前三个槽位与 U 的分块关系保持不变
+            branches.append(trope_out)
+        out = torch.cat(branches, dim=-1) # [b, s, n_branches * d]
         out = out * U
         if self.has_moe:
             out, aux = self.ffn(out) # [b, s, d] + 负载均衡项（标量）
@@ -591,11 +778,14 @@ class hstublock(nn.Module):
 class hstu(nn.Module):
     def __init__(self, input_dim, head, num_layers, num_experts=1, top_k=1,
                  time_bias_per_layer=False, num_shared=0, routed_scale=1.0,
-                 balance="aux_loss", ffn_act="none"):
+                 balance="aux_loss", ffn_act="none",
+                 trope=False, trope_shifted_query=False):
         super(hstu, self).__init__()
+        # ⚠️ 下面这 8 个是**位置传参**：加了 trope / trope_shifted_query 就必须同步补成
+        # 10 个，否则开关从这里就被丢掉了（这是整条链上唯一会漏的一处）。
         self.layers = nn.ModuleList([hstublock(input_dim, head, num_experts, top_k,
                                                num_shared, routed_scale, balance,
-                                               ffn_act)
+                                               ffn_act, trope, trope_shifted_query)
                                      for _ in range(num_layers)])
         self.time_bias_per_layer = bool(time_bias_per_layer)
         # 相对时间偏置表：桶 0 = 对角线 / padding / 上三角，1..128 = Δ 的分桶，共 129 行。
@@ -680,10 +870,18 @@ class hstu(nn.Module):
         for table in self.time_layers:
             yield self.time_bias(bucket, mask, table)
 
-    def forward(self, x, mask, seq_ts, return_aux=False):
+    def forward(self, x, mask, seq_ts, return_aux=False, rot_ts=None):
+        """`rot_ts` 刻意排在 `return_aux` **之后**：它虽然读着别扭，但不占用第 4 个位置槽。
+
+        现有调用点（`tower.forward`、`tests/test_model_equiv.py`、`test_moe.py`、
+        `test_time_bias.py`）都是按 `(x, mask, seq_ts)` 传的，一旦有人第 4 位按位置传
+        `return_aux`，把它插在前面就会把这个 bool 静默吃成一个张量。宁可读着别扭。
+
+        `rot_ts` 由 `tower.forward` 算好（居中的时间戳），开了 trope 时必须给，关闭时=None。
+        """
         aux = None
         for layer, rel_ts in zip(self.layers, self._rel_ts_per_layer(seq_ts, mask)):
-            x, a = layer(x, mask, rel_ts)
+            x, a = layer(x, mask, rel_ts, rot_ts)
             if a is not None:
                 aux = a if aux is None else aux + a
         if not return_aux:
@@ -704,7 +902,8 @@ class tower(nn.Module):
     def __init__(self, user_item_list, item_item_list, embbeding_dim, hidden_units=512,
                  dropout=0.2, item_only_cols=None, user_array_cols=(),
                  num_experts=1, top_k=1, time_bias_per_layer=False, num_shared=0,
-                 routed_scale=1.0, balance="aux_loss", ffn_act="none"):
+                 routed_scale=1.0, balance="aux_loss", ffn_act="none",
+                 trope=False, trope_shifted_query=False):
         super(tower, self).__init__()
         assert hidden_units % 8 == 0, "hidden_units 必须能被 head 数 8 整除（O_o/model.py:181）"
         self.user_item_list = user_item_list
@@ -742,11 +941,13 @@ class tower(nn.Module):
         self.routed_scale = routed_scale
         self.balance = balance
         self.ffn_act = ffn_act
+        self.trope = trope
         self.HSTU = hstu(input_dim=hidden_units, head=8, num_layers=8,  # head=8: O_o/main.py:38
                          num_experts=num_experts, top_k=top_k,
                          time_bias_per_layer=time_bias_per_layer,
                          num_shared=num_shared, routed_scale=routed_scale,
-                         balance=balance, ffn_act=ffn_act)
+                         balance=balance, ffn_act=ffn_act,
+                         trope=trope, trope_shifted_query=trope_shifted_query)
 
         # 时间离散特征表：hour 1..24 / dow 1..7 / weekend 1..2，0 一律留给 pad
         self.hour_emb = nn.Embedding(24 + 1, embbeding_dim, padding_idx=0)
@@ -884,10 +1085,32 @@ class tower(nn.Module):
             s = token_type.shape[1]
             tril = torch.tril(torch.ones(s, s, dtype=torch.bool, device=token_type.device))
             attn_mask = ~(tril & valid.unsqueeze(2) & valid.unsqueeze(1)) #[b, s, s]，True = 屏蔽
+            # 第四路的时间戳：**逐序列居中**，减去每条序列第一个有效 token 的时间。
+            #
+            # 理由见 `Trope` 的 docstring（fp32 下 1.7e9 的 ulp 是 128 秒，减掉原点后落到
+            # 会话跨度、ulp 变 2 秒；且绝对秒会让每对 (i,j) 的相位被同一个巨大常数主导）。
+            #
+            # **为什么是逐序列而不是全局原点**：相位里有一项 `(α_k+α_q)·T_user/β`，
+            # `T_user` 是会话在数据集里的绝对位置。逐序列居中把它按构造成 0，于是
+            # `Δ → 注意力权重` 这个映射对所有用户一致、可学；用全局原点时它逐用户随机
+            # （快平面在 231 天上扫 ~300 个整周期），梯度互相抵消 —— 实测 α 训练前后
+            # 几乎没动，`|α|` 均值 0.62~0.97 对上 `N(0,1)` 的 0.798。见
+            # `DIFF_vs_O_o.md` §2.6 与 `docs/superpowers/plans/2026-10-12-...md` §5。
+            #
+            # 代价：原点会随 `--user_seq_order` 变 —— `o_o` 的 user 块是时间倒序，首位拿到
+            # 的是 user 块里最新的那条；`chrono` 下首位是最旧的（`= 窗口开头`）。本仓库的
+            # 正式跑都用 `chrono`，所以原点就是窗口开头。
+            #
+            # pad 位会变成 `-t_ref`，不需要管：那里的 Q/K 恒为 0，旋转零向量还是零向量。
+            rot_ts = None
+            if self.trope:
+                first = valid.long().argmax(dim=1, keepdim=True)   # 全 pad 行给 0
+                rot_ts = ts - ts.gather(1, first)                  # [b, s]，int64
             if return_aux:
-                output, aux = self.HSTU(output, attn_mask, seq_ts, return_aux=True)
+                output, aux = self.HSTU(output, attn_mask, seq_ts, return_aux=True,
+                                        rot_ts=rot_ts)
             else:
-                output = self.HSTU(output, attn_mask, seq_ts)
+                output = self.HSTU(output, attn_mask, seq_ts, rot_ts=rot_ts)
             output = torch.nn.functional.normalize(output, p=2, dim=-1)
         if not return_aux:
             return output
